@@ -81,6 +81,7 @@ export async function getUserAuthorizationFromSupabase(
 
     console.log('User query result:', { user, userError });
 
+    // AUTO-PROVISIONING: Create user if not found
     if (userError || !user) {
       const msg = (userError as any)?.message || '';
       if (msg.includes('Invalid API key') || (userError as any)?.code === '401') {
@@ -90,6 +91,145 @@ export async function getUserAuthorizationFromSupabase(
           email
         };
       }
+
+      // Check if auto-provisioning is enabled
+      const AUTO_PROVISION = import.meta.env.VITE_AUTO_PROVISION_USERS === 'true';
+      
+      if (AUTO_PROVISION) {
+        console.log('🔄 Auto-provisioning new user:', email);
+        
+        // Get or create default organization
+        const DEFAULT_ORG_NAME = import.meta.env.VITE_DEFAULT_ORG_NAME || 'default-org';
+        let { data: org } = await supabase
+          .from('auth_organizations')
+          .select('id')
+          .eq('name', DEFAULT_ORG_NAME)
+          .single();
+
+        if (!org) {
+          // Create default organization if it doesn't exist
+          const { data: newOrg } = await supabase
+            .from('auth_organizations')
+            .insert({
+              name: DEFAULT_ORG_NAME,
+              display_name: 'Default Organization',
+              type: 'staff',
+              status: 'Active'
+            })
+            .select('id')
+            .single();
+          org = newOrg;
+        }
+
+        if (!org) {
+          throw {
+            error: 'auto_provision_failed',
+            message: 'Failed to create default organization for auto-provisioning.',
+            email
+          };
+        }
+
+        // Create the user
+        const { data: newUser, error: createUserError } = await supabase
+          .from('auth_users')
+          .insert({
+            email,
+            name: email.split('@')[0], // Use email prefix as name
+            azure_oid: azureOid,
+            is_active: true
+          })
+          .select('id, email, name, azure_oid')
+          .single();
+
+        if (createUserError || !newUser) {
+          console.error('Failed to create user:', createUserError);
+          throw {
+            error: 'auto_provision_failed',
+            message: 'Failed to auto-provision user account.',
+            email
+          };
+        }
+
+        // Create user profile with default role
+        const DEFAULT_ROLE = import.meta.env.VITE_DEFAULT_USER_ROLE || 'viewer';
+        const DEFAULT_SEGMENT = import.meta.env.VITE_DEFAULT_USER_SEGMENT || 'customer';
+
+        const { error: createProfileError } = await supabase
+          .from('auth_user_profiles')
+          .insert({
+            user_id: newUser.id,
+            organization_id: org.id,
+            role: DEFAULT_ROLE,
+            user_segment: DEFAULT_SEGMENT
+          });
+
+        if (createProfileError) {
+          console.error('Failed to create user profile:', createProfileError);
+          throw {
+            error: 'auto_provision_failed',
+            message: 'Failed to create user profile.',
+            email
+          };
+        }
+
+        console.log('✅ User auto-provisioned successfully:', {
+          email,
+          role: DEFAULT_ROLE,
+          segment: DEFAULT_SEGMENT
+        });
+
+        // Continue with the newly created user
+        const { data: provisionedUser } = await supabase
+          .from('auth_users')
+          .select('id, email, name, azure_oid')
+          .eq('azure_oid', azureOid)
+          .single();
+
+        if (!provisionedUser) {
+          throw {
+            error: 'auto_provision_failed',
+            message: 'User was created but could not be retrieved.',
+            email
+          };
+        }
+
+        // Use the provisioned user for the rest of the flow
+        const { data: profile } = await supabase
+          .from('auth_user_profiles')
+          .select('organization_id, role, user_segment')
+          .eq('user_id', provisionedUser.id)
+          .single();
+
+        if (!profile) {
+          throw {
+            error: 'incomplete_profile',
+            message: 'User profile was not created properly.',
+            email
+          };
+        }
+
+        let organizationName: string | null = null;
+        if (profile.organization_id) {
+          const { data: orgData } = await supabase
+            .from('auth_organizations')
+            .select('name, display_name')
+            .eq('id', profile.organization_id)
+            .single();
+          organizationName = (orgData?.display_name as string) || (orgData?.name as string) || null;
+        }
+
+        return {
+          user_id: provisionedUser.id,
+          organization_id: profile.organization_id,
+          organization_name: organizationName || undefined,
+          role: profile.role,
+          user_segment: profile.user_segment,
+          email: provisionedUser.email || email,
+          name: provisionedUser.name
+        };
+      }
+
+      // If auto-provisioning is disabled, throw error
       throw {
         error: 'user_not_provisioned',
         message: 'Your account has not been provisioned. Please contact your administrator to request access.',
